@@ -9,7 +9,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -71,14 +70,6 @@ func parseConfig() (*config, error) {
 		switch key {
 		case "bearer-token":
 			cfg.BearerToken = value
-		case "header":
-			idx := strings.Index(value, "=")
-			if idx <= 0 {
-				continue
-			}
-			headerKey := value[:idx]
-			headerValue := value[idx+1:]
-			cfg.Headers[headerKey] = headerValue
 		}
 	}
 

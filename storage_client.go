@@ -19,7 +19,6 @@ type storageClient struct {
 	client      *http.Client
 	baseURL     *url.URL
 	bearerToken string
-	headers     map[string]string
 	logger      *logger
 	mu          sync.Mutex
 }
@@ -38,7 +37,6 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 		client:      client,
 		baseURL:     cfg.URL,
 		bearerToken: cfg.BearerToken,
-		headers:     cfg.Headers,
 		logger:      logger,
 	}, nil
 }
@@ -205,9 +203,5 @@ func (s *storageClient) addHeaders(req *http.Request) {
 
 	if s.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.bearerToken)
-	}
-
-	for key, value := range s.headers {
-		req.Header.Set(key, value)
 	}
 }

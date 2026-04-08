@@ -30,7 +30,6 @@ production ready) **C++** implementation.
 - HTTP keep-alive for efficient connection reuse
 - Cross-platform: Linux, macOS, Windows
 - Bearer token authentication support
-- Support for custom HTTP headers
 - Optional debug logging
 
 ## Installation
@@ -95,7 +94,6 @@ See also the [HTTP storage wiki page] for tips on how to set up a storage server
 The helper supports the following custom attributes:
 
 - `@bearer-token`: Bearer token for `Authorization` header
-- `@header`: Custom HTTP headers (can be specified multiple times)
 
 Example:
 
