@@ -4,38 +4,72 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
-	"fmt"
-	"io"
-	"net/http"
 	"net/url"
-	"strings"
+	"path"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/go-redis/redis/v8"
 )
 
 type storageClient struct {
-	client      *http.Client
+	client      *redis.Client
+	context     context.Context
+	timeout     time.Duration
 	baseURL     *url.URL
+	prefix      string
 	bearerToken string
 	logger      *logger
 	mu          sync.Mutex
 }
 
 func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		},
+	username := cfg.URL.User.Username()
+	password, _ := cfg.URL.User.Password()
+	// ccache sends password only as username
+	if username != "" && password == "" {
+		password = username
+		username = ""
 	}
+	var network string
+	var addr string
+	var dbstr string
+	switch cfg.URL.Scheme {
+	case "redis":
+		network = "tcp"
+		addr = cfg.URL.Host
+		dbstr = path.Base(cfg.URL.Path)
+	case "redis+unix":
+		network = "unix"
+		addr = cfg.URL.Path
+		dbstr = cfg.URL.Query().Get("db")
+	}
+	db := 0
+	if dbstr != "." && dbstr != "" {
+		i, err := strconv.Atoi(dbstr)
+		if err != nil {
+			return nil, err
+		}
+		db = i
+	}
+	client := redis.NewClient(&redis.Options{
+		Network:     network,
+		Username:    username,
+		Password:    password,
+		Addr:        addr,
+		DB:          db,
+		IdleTimeout: 90 * time.Second,
+	})
 
 	return &storageClient{
 		client:      client,
+		context:     context.Background(),
+		timeout:     10 * time.Second,
 		baseURL:     cfg.URL,
+		prefix:      "ccache",
 		bearerToken: cfg.BearerToken,
 		logger:      logger,
 	}, nil
@@ -48,17 +82,9 @@ func (s *storageClient) keyToPath(key []byte) string {
 }
 
 func (s *storageClient) buildURL(key []byte) (string, error) {
-	base := *s.baseURL // Copy to avoid modifying the original
 	path := s.keyToPath(key)
-	if strings.HasSuffix(base.Path, "/") {
-		base.Path = base.Path + path
-	} else if base.Path == "" {
-		base.Path = "/" + path
-	} else {
-		base.Path = base.Path + "/" + path
-	}
 
-	return base.String(), nil
+	return s.prefix + ":" + path, nil
 }
 
 func (s *storageClient) get(key []byte) ([]byte, bool, error) {
@@ -71,33 +97,17 @@ func (s *storageClient) get(key []byte) ([]byte, bool, error) {
 	}
 
 	s.logger.logf("GET %s", urlStr)
-	req, err := http.NewRequest("GET", urlStr, nil)
-	if err != nil {
-		return nil, false, err
-	}
-
-	s.addHeaders(req)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
+	ctx, cancel := context.WithTimeout(s.context, s.timeout)
+	defer cancel()
+	val, err := s.client.Get(ctx, urlStr).Result()
+	if err == redis.Nil {
 		return nil, false, nil
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	value, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, false, err
 	}
 
-	return value, true, nil
+	return []byte(val), true, nil
 }
 
 func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, error) {
@@ -119,28 +129,15 @@ func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, err
 		}
 	}
 
-	s.logger.logf("PUT %s (%d bytes)", urlStr, len(value))
-	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(value))
+	s.logger.logf("SET %s (%d bytes)", urlStr, len(value))
+	ctx, cancel := context.WithTimeout(s.context, s.timeout)
+	defer cancel()
+	err = s.client.Set(ctx, urlStr, value, 0).Err()
 	if err != nil {
 		return false, err
 	}
 
-	s.addHeaders(req)
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	io.Copy(io.Discard, resp.Body) // Read and discard to enable connection reuse
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return true, nil
-	}
-
-	return false, fmt.Errorf("HTTP %d", resp.StatusCode)
+	return true, nil
 }
 
 func (s *storageClient) remove(key []byte) (bool, error) {
@@ -152,56 +149,24 @@ func (s *storageClient) remove(key []byte) (bool, error) {
 		return false, err
 	}
 
-	s.logger.logf("DELETE %s", urlStr)
-	req, err := http.NewRequest("DELETE", urlStr, nil)
+	s.logger.logf("DEL %s", urlStr)
+	ctx, cancel := context.WithTimeout(s.context, s.timeout)
+	defer cancel()
+	val, err := s.client.Del(ctx, urlStr).Result()
 	if err != nil {
 		return false, err
 	}
 
-	s.addHeaders(req)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	io.Copy(io.Discard, resp.Body) // Read and discard to enable connection reuse
-
-	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
-	}
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return true, nil
-	}
-
-	return false, fmt.Errorf("HTTP %d", resp.StatusCode)
+	return val != 0, nil
 }
 
 func (s *storageClient) exists(urlStr string) (bool, error) {
-	req, err := http.NewRequest("HEAD", urlStr, nil)
+	ctx, cancel := context.WithTimeout(s.context, s.timeout)
+	defer cancel()
+	val, err := s.client.Exists(ctx, urlStr).Result()
 	if err != nil {
 		return false, err
 	}
 
-	s.addHeaders(req)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	io.Copy(io.Discard, resp.Body) // Read and discard to enable connection reuse
-
-	return resp.StatusCode == http.StatusOK, nil
-}
-
-func (s *storageClient) addHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", "ccache-storage-http-go/"+version)
-
-	if s.bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.bearerToken)
-	}
+	return val != 0, nil
 }
