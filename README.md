@@ -1,7 +1,7 @@
 # ccache-storage-http-go
 
 A [ccache remote storage helper](https://ccache.dev/storage-helpers.html) for
-HTTP/HTTPS storage, written in **Go**.
+HTTP/HTTPS, written in **Go**.
 
 ## Overview
 
@@ -12,9 +12,9 @@ protocol].
 This project aims to:
 
 1. Provide a high-performance, production-ready HTTP(S) ccache storage helper.
-2. Serve as an example implementation of a ccache storage helper in **Go**. Feel
-   free to use it as a starting point for implementing helpers for other storage
-   service protocols.
+2. Serve as an example implementation of a ccache storage helper in **Go**.
+   Feel free to use it as a starting point for implementing helpers for other
+   storage service protocols.
 
 See also the similar [ccache-storage-http-cpp] project for an example (and
 production ready) **C++** implementation.
