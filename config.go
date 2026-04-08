@@ -18,7 +18,6 @@ type config struct {
 	IPCEndpoint string
 	URL         *url.URL
 	IdleTimeout time.Duration
-	Layout      string
 	BearerToken string
 	Headers     map[string]string
 }
@@ -31,7 +30,6 @@ func parseConfig() (*config, error) {
 	cfg := &config{
 		LogFile:     os.Getenv("CRSH_LOGFILE"),
 		IPCEndpoint: ipcEndpoint,
-		Layout:      "subdirs",
 		Headers:     make(map[string]string),
 	}
 
@@ -71,8 +69,6 @@ func parseConfig() (*config, error) {
 		}
 
 		switch key {
-		case "layout":
-			cfg.Layout = value
 		case "bearer-token":
 			cfg.BearerToken = value
 		case "header":

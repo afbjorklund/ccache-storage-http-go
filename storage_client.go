@@ -18,7 +18,6 @@ import (
 type storageClient struct {
 	client      *http.Client
 	baseURL     *url.URL
-	layout      string
 	bearerToken string
 	headers     map[string]string
 	logger      *logger
@@ -38,7 +37,6 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 	return &storageClient{
 		client:      client,
 		baseURL:     cfg.URL,
-		layout:      cfg.Layout,
 		bearerToken: cfg.BearerToken,
 		headers:     cfg.Headers,
 		logger:      logger,
@@ -48,24 +46,7 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 func (s *storageClient) keyToPath(key []byte) string {
 	keyHex := hex.EncodeToString(key)
 
-	switch s.layout {
-	case "flat":
-		return keyHex
-
-	case "bazel":
-		// Bazel format: ac/ + 64 hex digits, so pad shorter keys by repeating the key prefix to reach the expected SHA256 size.
-		const sha256HexSize = 64
-		if len(keyHex) >= sha256HexSize {
-			return fmt.Sprintf("ac/%s", keyHex[:sha256HexSize])
-		}
-		return fmt.Sprintf("ac/%s%s", keyHex, keyHex[:sha256HexSize-len(keyHex)])
-
-	default: // subdirs
-		if len(keyHex) < 2 {
-			return keyHex
-		}
-		return fmt.Sprintf("%s/%s", keyHex[:2], keyHex[2:])
-	}
+	return keyHex
 }
 
 func (s *storageClient) buildURL(key []byte) (string, error) {
