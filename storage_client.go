@@ -9,11 +9,15 @@ import (
 	"net/url"
 	"path"
 	"strconv"
-	"sync"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+const httpTransportBufferSize = 64 << 10
 
 type storageClient struct {
 	client      *redis.Client
@@ -22,8 +26,9 @@ type storageClient struct {
 	baseURL     *url.URL
 	prefix      string
 	bearerToken string
+	basicAuthUser string
+	basicAuthPass string
 	logger      *logger
-	mu          sync.Mutex
 }
 
 func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
@@ -64,7 +69,7 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 		ConnMaxIdleTime: 90 * time.Second,
 	})
 
-	return &storageClient{
+	sc := &storageClient{
 		client:      client,
 		context:     context.Background(),
 		timeout:     10 * time.Second,
@@ -72,7 +77,32 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 		prefix:      "ccache",
 		bearerToken: cfg.BearerToken,
 		logger:      logger,
-	}, nil
+	}
+
+	if cfg.UseNetrc {
+		netrcPath := cfg.NetrcFile
+		if netrcPath == "" {
+			netrcPath = defaultNetrcPath()
+		}
+		if netrcPath != "" {
+			requestedLogin := ""
+			if cfg.URL.User != nil {
+				requestedLogin = cfg.URL.User.Username()
+			}
+
+			login, password, err := findNetrcCredentials(netrcPath, cfg.URL.Hostname(), requestedLogin)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					logger.logf("Warning: could not read netrc file %q: %v", netrcPath, err)
+				}
+			} else {
+				sc.basicAuthUser = login
+				sc.basicAuthPass = password
+			}
+		}
+	}
+
+	return sc, nil
 }
 
 func (s *storageClient) keyToPath(key []byte) string {
@@ -87,13 +117,20 @@ func (s *storageClient) buildURL(key []byte) (string, error) {
 	return s.prefix + ":" + path, nil
 }
 
-func (s *storageClient) get(key []byte) ([]byte, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *storageClient) exists(key []byte) (bool, error) {
 	urlStr, err := s.buildURL(key)
 	if err != nil {
-		return nil, false, err
+		return false, err
+	}
+
+	s.logger.logf("EXISTS %s", urlStr)
+	return s.head(urlStr)
+}
+
+func (s *storageClient) get(key []byte) (io.ReadCloser, int64, bool, error) {
+	urlStr, err := s.buildURL(key)
+	if err != nil {
+		return nil, 0, false, err
 	}
 
 	s.logger.logf("GET %s", urlStr)
@@ -101,26 +138,23 @@ func (s *storageClient) get(key []byte) ([]byte, bool, error) {
 	defer cancel()
 	val, err := s.client.Get(ctx, urlStr).Result()
 	if err == redis.Nil {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 
-	return []byte(val), true, nil
+	return io.NopCloser(strings.NewReader(val)), int64(len(val)), true, nil
 }
 
-func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *storageClient) put(key []byte, value io.Reader, size int64, overwrite bool) (bool, error) {
 	urlStr, err := s.buildURL(key)
 	if err != nil {
 		return false, err
 	}
 
 	if !overwrite {
-		exists, err := s.exists(urlStr)
+		exists, err := s.head(urlStr)
 		if err != nil {
 			return false, err
 		}
@@ -129,7 +163,7 @@ func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, err
 		}
 	}
 
-	s.logger.logf("SET %s (%d bytes)", urlStr, len(value))
+	s.logger.logf("SET %s (%d bytes)", urlStr, size)
 	ctx, cancel := context.WithTimeout(s.context, s.timeout)
 	defer cancel()
 	err = s.client.Set(ctx, urlStr, value, 0).Err()
@@ -141,9 +175,6 @@ func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, err
 }
 
 func (s *storageClient) remove(key []byte) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	urlStr, err := s.buildURL(key)
 	if err != nil {
 		return false, err
@@ -160,7 +191,7 @@ func (s *storageClient) remove(key []byte) (bool, error) {
 	return val != 0, nil
 }
 
-func (s *storageClient) exists(urlStr string) (bool, error) {
+func (s *storageClient) head(urlStr string) (bool, error) {
 	ctx, cancel := context.WithTimeout(s.context, s.timeout)
 	defer cancel()
 	val, err := s.client.Exists(ctx, urlStr).Result()

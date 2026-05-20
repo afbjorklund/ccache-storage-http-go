@@ -12,24 +12,33 @@ import (
 	"time"
 )
 
+type layout string
+
+const (
+	layoutBazel   layout = "bazel"
+	layoutFlat    layout = "flat"
+	layoutSubdirs layout = "subdirs"
+)
+
 type config struct {
-	LogFile     string
 	IPCEndpoint string
 	URL         *url.URL
 	IdleTimeout time.Duration
+	Diagnostics []string
 	BearerToken string
-	Headers     map[string]string
+	UseNetrc    bool
+	NetrcFile   string
 }
 
-func parseConfig() (*config, error) {
+func parseConfig(logger *logger) (*config, error) {
 	ipcEndpoint := os.Getenv("CRSH_IPC_ENDPOINT")
 	if runtime.GOOS == "windows" {
 		ipcEndpoint = `\\.\pipe\` + ipcEndpoint
 	}
+	logger.logf("IPC endpoint: %s", ipcEndpoint)
+
 	cfg := &config{
-		LogFile:     os.Getenv("CRSH_LOGFILE"),
 		IPCEndpoint: ipcEndpoint,
-		Headers:     make(map[string]string),
 	}
 
 	urlStr := os.Getenv("CRSH_URL")
@@ -41,6 +50,7 @@ func parseConfig() (*config, error) {
 		return nil, fmt.Errorf("invalid CRSH_URL: %w", err)
 	}
 	cfg.URL = parsedURL
+	logger.logf("URL: %s", cfg.URL)
 
 	idleTimeout := os.Getenv("CRSH_IDLE_TIMEOUT")
 	if idleTimeout == "" {
@@ -51,6 +61,7 @@ func parseConfig() (*config, error) {
 		return nil, fmt.Errorf("invalid CRSH_IDLE_TIMEOUT: %w", err)
 	}
 	cfg.IdleTimeout = time.Duration(timeoutSecs) * time.Second
+	logger.logf("Idle timeout: %s", cfg.IdleTimeout)
 
 	numAttr := os.Getenv("CRSH_NUM_ATTR")
 	if numAttr == "" {
@@ -63,14 +74,23 @@ func parseConfig() (*config, error) {
 	for i := 0; i < n; i++ {
 		key := os.Getenv(fmt.Sprintf("CRSH_ATTR_KEY_%d", i))
 		value := os.Getenv(fmt.Sprintf("CRSH_ATTR_VALUE_%d", i))
-		if key == "" {
-			continue
-		}
+		logger.logf("Attribute: %s=%s", key, value)
 
 		switch key {
 		case "bearer-token":
 			cfg.BearerToken = value
+		case "netrc-file":
+			cfg.NetrcFile = value
+			cfg.UseNetrc = true
+		case "use-netrc":
+			cfg.UseNetrc = value == "true"
+		default:
+			cfg.Diagnostics = append(cfg.Diagnostics, fmt.Sprintf("warning: unknown attribute: %s", key))
 		}
+	}
+
+	for _, diag := range cfg.Diagnostics {
+		logger.logf("%s", diag)
 	}
 
 	return cfg, nil
