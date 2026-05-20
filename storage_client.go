@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 type storageClient struct {
@@ -56,12 +56,12 @@ func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
 		db = i
 	}
 	client := redis.NewClient(&redis.Options{
-		Network:     network,
-		Username:    username,
-		Password:    password,
-		Addr:        addr,
-		DB:          db,
-		IdleTimeout: 90 * time.Second,
+		Network:         network,
+		Username:        username,
+		Password:        password,
+		Addr:            addr,
+		DB:              db,
+		ConnMaxIdleTime: 90 * time.Second,
 	})
 
 	return &storageClient{
