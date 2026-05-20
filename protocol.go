@@ -11,20 +11,25 @@ import (
 )
 
 type storage interface {
+	exists(key []byte) (bool, error)
 	get(key []byte) (io.ReadCloser, int64, bool, error)
 	put(key []byte, value io.Reader, size int64, overwrite bool) (bool, error)
 	remove(key []byte) (bool, error)
 }
 
 const (
-	greetingFormat1 = 0x01
-	greetingFormat2 = 0x02
-	cap0            = 0x00 // get/put/remove/stop operations
+	protocolVersion = 0x01
+
+	capGetPutRemove = 0x00
+	capInfo         = 0x01
+	capExists       = 0x02
 
 	requestGet    = 0x00
 	requestPut    = 0x01
 	requestRemove = 0x02
 	requestStop   = 0x03
+	requestInfo   = 0x04
+	requestExists = 0x05
 
 	responseOK   = 0x00
 	responseNoop = 0x01
@@ -33,15 +38,10 @@ const (
 	putFlagOverwrite = 0x01
 )
 
-func writeGreeting(w io.Writer, formatMax int, diagnostics []string) error {
-	caps := [...]byte{cap0}
+func writeGreeting(w io.Writer) error {
+	caps := [...]byte{capGetPutRemove, capInfo, capExists}
 
-	format := greetingFormat1
-	if formatMax >= greetingFormat2 {
-		format = greetingFormat2
-	}
-
-	if err := writeByte(w, byte(format)); err != nil {
+	if err := writeByte(w, protocolVersion); err != nil {
 		return err
 	}
 	if err := writeByte(w, uint8(len(caps))); err != nil {
@@ -49,23 +49,6 @@ func writeGreeting(w io.Writer, formatMax int, diagnostics []string) error {
 	}
 	if _, err := w.Write(caps[:]); err != nil {
 		return err
-	}
-
-	if format >= greetingFormat2 {
-		if err := writeMsg(w, "ccache-storage-http-go "+version); err != nil {
-			return err
-		}
-		if len(diagnostics) > 255 {
-			diagnostics = diagnostics[:255]
-		}
-		if err := writeByte(w, uint8(len(diagnostics))); err != nil {
-			return err
-		}
-		for _, diag := range diagnostics {
-			if err := writeMsg(w, diag); err != nil {
-				return err
-			}
-		}
 	}
 
 	return nil
@@ -114,6 +97,13 @@ func writeValue(w io.Writer, value []byte) error {
 	}
 	_, err := w.Write(value)
 	return err
+}
+
+func writeBool(w io.Writer, b bool) error {
+	if b {
+		return writeByte(w, 0x01)
+	}
+	return writeByte(w, 0x00)
 }
 
 func writeByte(w io.Writer, b byte) error {
@@ -171,6 +161,27 @@ func readMsg(r io.Reader) (string, error) {
 	return string(msg), nil
 }
 
+func handleExists(r io.Reader, w io.Writer, s storage, logger *logger) error {
+	key, err := readKey(r)
+	if err != nil {
+		return err
+	}
+
+	logger.logf("EXISTS request for key %x", key)
+
+	found, err := s.exists(key)
+	if err != nil {
+		logger.logf("EXISTS error: %v", err)
+		return writeErr(w, err.Error())
+	}
+
+	logger.logf("EXISTS result: %v", found)
+	if err := writeOK(w); err != nil {
+		return err
+	}
+	return writeBool(w, found)
+}
+
 func handleGet(r io.Reader, w io.Writer, s storage, logger *logger) error {
 	key, err := readKey(r)
 	if err != nil {
@@ -216,6 +227,27 @@ func handleGet(r io.Reader, w io.Writer, s storage, logger *logger) error {
 		return err
 	}
 	return writeValue(w, value)
+}
+
+func handleInfo(w io.Writer, c *config, logger *logger) error {
+	logger.logf("INFO request")
+
+	if err := writeMsg(w, "ccache-storage-http-go "+version); err != nil {
+		return err
+	}
+	diagnostics := c.Diagnostics
+	if len(diagnostics) > 255 {
+		diagnostics = diagnostics[:255]
+	}
+	if err := writeByte(w, uint8(len(diagnostics))); err != nil {
+		return err
+	}
+	for _, diag := range diagnostics {
+		if err := writeMsg(w, diag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func handlePut(r io.Reader, w io.Writer, s storage, logger *logger) error {
@@ -288,15 +320,23 @@ func handleStop(w io.Writer, logger *logger) error {
 	return writeOK(w)
 }
 
-func processRequest(r io.Reader, w io.Writer, s storage, logger *logger) (bool, error) {
+func processRequest(r io.Reader, w io.Writer, s storage, logger *logger, c *config) (bool, error) {
 	reqType, err := readRequest(r)
 	if err != nil {
 		return false, err
 	}
 
 	switch reqType {
+	case requestExists:
+		if err := handleExists(r, w, s, logger); err != nil {
+			return false, err
+		}
 	case requestGet:
 		if err := handleGet(r, w, s, logger); err != nil {
+			return false, err
+		}
+	case requestInfo:
+		if err := handleInfo(w, c, logger); err != nil {
 			return false, err
 		}
 	case requestPut:

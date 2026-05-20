@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -23,7 +24,6 @@ import (
 )
 
 const testHelperEnv = "CRSH_TEST_HELPER"
-const unsetFormatMax = -1
 
 func TestMain(m *testing.M) {
 	// When re-invoked as the helper process, behave as the real binary.
@@ -120,12 +120,16 @@ type helperProcess struct {
 	tmpDir     string
 	socketPath string
 	logPath    string
-	formatMax  int
 	cmd        *exec.Cmd
 	conn       net.Conn
 }
 
-func newHelperProcessWithFormatMax(t *testing.T, baseURL string, formatMax int) *helperProcess {
+type helperAttr struct {
+	key   string
+	value string
+}
+
+func newHelperProcessWithAttrs(t *testing.T, baseURL string, attrs []helperAttr) *helperProcess {
 	t.Helper()
 	tmpDir := t.TempDir()
 	h := &helperProcess{
@@ -134,26 +138,17 @@ func newHelperProcessWithFormatMax(t *testing.T, baseURL string, formatMax int) 
 		tmpDir:     tmpDir,
 		socketPath: filepath.Join(tmpDir, "helper.sock"),
 		logPath:    filepath.Join(tmpDir, "helper.log"),
-		formatMax:  formatMax,
 	}
-	h.start()
+	h.start(attrs)
 	t.Cleanup(h.stop)
 	return h
 }
 
 func newHelperProcess(t *testing.T, baseURL string) *helperProcess {
-	t.Helper()
-	return newHelperProcessWithFormatMax(t, baseURL, greetingFormat2)
+	return newHelperProcessWithAttrs(t, baseURL, []helperAttr{{key: "layout", value: "flat"}})
 }
 
-func formatMaxLabel(formatMax int) string {
-	if formatMax == unsetFormatMax {
-		return "CRSH_FORMAT_MAX unset"
-	}
-	return fmt.Sprintf("CRSH_FORMAT_MAX=%d", formatMax)
-}
-
-func (h *helperProcess) start() {
+func (h *helperProcess) start(attrs []helperAttr) {
 	h.t.Helper()
 
 	exe, err := os.Executable()
@@ -166,13 +161,14 @@ func (h *helperProcess) start() {
 		"CRSH_IPC_ENDPOINT="+h.socketPath,
 		"CRSH_URL="+h.baseURL,
 		"CRSH_IDLE_TIMEOUT=30",
-		"CRSH_NUM_ATTR=1",
-		"CRSH_ATTR_KEY_0=layout",
-		"CRSH_ATTR_VALUE_0=flat",
+		fmt.Sprintf("CRSH_NUM_ATTR=%d", len(attrs)),
 		"CRSH_LOGFILE="+h.logPath,
 	)
-	if h.formatMax != unsetFormatMax {
-		env = append(env, "CRSH_FORMAT_MAX="+strconv.Itoa(h.formatMax))
+	for i, attr := range attrs {
+		env = append(env,
+			fmt.Sprintf("CRSH_ATTR_KEY_%d=%s", i, attr.key),
+			fmt.Sprintf("CRSH_ATTR_VALUE_%d=%s", i, attr.value),
+		)
 	}
 
 	h.cmd = exec.Command(exe)
@@ -219,45 +215,24 @@ func (h *helperProcess) start() {
 func (h *helperProcess) validateGreeting() {
 	h.t.Helper()
 
-	greeting := make([]byte, 3)
+	greeting := make([]byte, 5)
 	if _, err := io.ReadFull(h.conn, greeting); err != nil {
 		h.cmd.Process.Kill()
 		h.cmd.Wait()
 		h.t.Fatalf("read greeting: %v; helper log:\n%s", err, h.readLog())
 	}
 
-	wantFormat := byte(greetingFormat1)
-	if h.formatMax >= int(greetingFormat2) {
-		wantFormat = byte(greetingFormat2)
-	}
-	if greeting[0] != wantFormat || greeting[1] != 1 || greeting[2] != cap0 {
+	if greeting[0] != 1 {
 		h.cmd.Process.Kill()
 		h.cmd.Wait()
-		h.t.Fatalf("unexpected greeting %v for %s; helper log:\n%s", greeting, formatMaxLabel(h.formatMax), h.readLog())
+		h.t.Fatalf("unexpected protocol version %v; helper log:\n%s", greeting[0], h.readLog())
 	}
 
-	if wantFormat < byte(greetingFormat2) {
-		return
-	}
-
-	if serverId := h.readMsg(); serverId != "ccache-storage-http-go "+version {
+	if !bytes.Equal(greeting[1:], []byte{3, capGetPutRemove, capInfo, capExists}) {
 		h.cmd.Process.Kill()
 		h.cmd.Wait()
-		h.t.Fatalf("unexpected greeting banner %q; helper log:\n%s", serverId, h.readLog())
+		h.t.Fatalf("unexpected capabilities; helper log:\n%s", h.readLog())
 	}
-
-	diagCount := h.readByte()
-	if diagCount == 0 {
-		return
-	}
-
-	diagnostics := make([]string, diagCount)
-	for i := range diagnostics {
-		diagnostics[i] = h.readMsg()
-	}
-	h.cmd.Process.Kill()
-	h.cmd.Wait()
-	h.t.Fatalf("unexpected greeting diagnostics %v; helper log:\n%s", diagnostics, h.readLog())
 }
 
 func (h *helperProcess) stop() {
@@ -280,6 +255,25 @@ func (h *helperProcess) stop() {
 		}
 		h.cmd = nil
 	}
+}
+
+type infoResponse struct {
+	identity    string
+	diagnostics []string
+}
+
+func (h *helperProcess) ipcInfo() infoResponse {
+	h.t.Helper()
+	h.write([]byte{requestInfo})
+
+	identity := h.readMsg()
+	diagCount := int(h.readByte())
+	diagnostics := make([]string, diagCount)
+	for i := range diagnostics {
+		diagnostics[i] = h.readMsg()
+	}
+
+	return infoResponse{identity: identity, diagnostics: diagnostics}
 }
 
 // ipcGet sends a GET request over IPC and returns (status, payload).
@@ -403,22 +397,34 @@ func hexNibble(t *testing.T, c byte) byte {
 
 // --- Integration tests ---
 
-func TestIntegrationGreetingDefaultsToFormat1WhenFormatMaxIsUnset(t *testing.T) {
+func TestIntegrationInfoReturnsIdentityAndDiagnostics(t *testing.T) {
 	server := newStubServer(t, map[[2]string]responseSpec{})
 
-	h := newHelperProcessWithFormatMax(t, server.url(), unsetFormatMax)
+	h := newHelperProcessWithAttrs(t, server.url(), []helperAttr{
+		{key: "layout", value: "flat"},
+		{key: "header", value: "broken-header"},
+		{key: "mystery", value: "value"},
+	})
 
-	status, payload := h.ipcGet("beef")
+	info := h.ipcInfo()
 
-	if status != responseNoop {
-		t.Fatalf("status: want %d (NOOP), got %d", responseNoop, status)
+	if info.identity != "ccache-storage-http-go "+version {
+		t.Fatalf("identity: want %q, got %q", "ccache-storage-http-go "+version, info.identity)
 	}
-	if payload != nil {
-		t.Fatalf("payload: want nil, got %q", payload)
+	wantDiagnostics := []string{
+		"error: invalid header (no \"=\"): broken-header",
+		"warning: unknown attribute: mystery",
 	}
-	reqs := server.requests()
-	if len(reqs) != 1 || reqs[0].method != "GET" || reqs[0].path != "/beef" {
-		t.Fatalf("want [GET /beef], got %v", reqs)
+	if len(info.diagnostics) != len(wantDiagnostics) {
+		t.Fatalf("diagnostics: want %d entries, got %d (%v)", len(wantDiagnostics), len(info.diagnostics), info.diagnostics)
+	}
+	for i, want := range wantDiagnostics {
+		if info.diagnostics[i] != want {
+			t.Fatalf("diagnostics[%d]: want %q, got %q", i, want, info.diagnostics[i])
+		}
+	}
+	if reqs := server.requests(); len(reqs) != 0 {
+		t.Fatalf("want no upstream HTTP requests, got %v", reqs)
 	}
 }
 
