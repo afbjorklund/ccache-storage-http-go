@@ -4,41 +4,72 @@
 package main
 
 import (
-	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
 )
+
+const httpTransportBufferSize = 64 << 10
 
 type storageClient struct {
 	client      *http.Client
 	baseURL     *url.URL
 	bearerToken string
+	basicAuthUser string
+	basicAuthPass string
 	logger      *logger
-	mu          sync.Mutex
 }
 
 func newStorageClient(cfg *config, logger *logger) (*storageClient, error) {
+	connectionPoolSize := max(32, runtime.GOMAXPROCS(0))
 	client := &http.Client{
-		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
+			MaxIdleConns:        connectionPoolSize,
+			MaxIdleConnsPerHost: connectionPoolSize,
+			MaxConnsPerHost:     connectionPoolSize,
 			IdleConnTimeout:     90 * time.Second,
+			ReadBufferSize:      httpTransportBufferSize,
+			WriteBufferSize:     httpTransportBufferSize,
 		},
 	}
 
-	return &storageClient{
+	sc := &storageClient{
 		client:      client,
 		baseURL:     cfg.URL,
 		bearerToken: cfg.BearerToken,
 		logger:      logger,
-	}, nil
+	}
+
+	if cfg.UseNetrc {
+		netrcPath := cfg.NetrcFile
+		if netrcPath == "" {
+			netrcPath = defaultNetrcPath()
+		}
+		if netrcPath != "" {
+			requestedLogin := ""
+			if cfg.URL.User != nil {
+				requestedLogin = cfg.URL.User.Username()
+			}
+
+			login, password, err := findNetrcCredentials(netrcPath, cfg.URL.Hostname(), requestedLogin)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					logger.logf("Warning: could not read netrc file %q: %v", netrcPath, err)
+				}
+			} else {
+				sc.basicAuthUser = login
+				sc.basicAuthPass = password
+			}
+		}
+	}
+
+	return sc, nil
 }
 
 func (s *storageClient) keyToPath(key []byte) string {
@@ -61,49 +92,39 @@ func (s *storageClient) buildURL(key []byte) (string, error) {
 	return base.String(), nil
 }
 
-func (s *storageClient) get(key []byte) ([]byte, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *storageClient) get(key []byte) (io.ReadCloser, int64, bool, error) {
 	urlStr, err := s.buildURL(key)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 
 	s.logger.logf("GET %s", urlStr)
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 
 	s.addHeaders(req)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, nil
+		resp.Body.Close()
+		return nil, 0, false, nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("HTTP %d", resp.StatusCode)
+		resp.Body.Close()
+		return nil, 0, false, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	value, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, false, err
-	}
-
-	return value, true, nil
+	return resp.Body, resp.ContentLength, true, nil
 }
 
-func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *storageClient) put(key []byte, value io.Reader, size int64, overwrite bool) (bool, error) {
 	urlStr, err := s.buildURL(key)
 	if err != nil {
 		return false, err
@@ -119,12 +140,12 @@ func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, err
 		}
 	}
 
-	s.logger.logf("PUT %s (%d bytes)", urlStr, len(value))
-	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(value))
+	s.logger.logf("PUT %s (%d bytes)", urlStr, size)
+	req, err := http.NewRequest("PUT", urlStr, value)
 	if err != nil {
 		return false, err
 	}
-
+	req.ContentLength = size
 	s.addHeaders(req)
 	req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -144,9 +165,6 @@ func (s *storageClient) put(key []byte, value []byte, overwrite bool) (bool, err
 }
 
 func (s *storageClient) remove(key []byte) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	urlStr, err := s.buildURL(key)
 	if err != nil {
 		return false, err
@@ -195,7 +213,15 @@ func (s *storageClient) exists(urlStr string) (bool, error) {
 
 	io.Copy(io.Discard, resp.Body) // Read and discard to enable connection reuse
 
-	return resp.StatusCode == http.StatusOK, nil
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("HTTP %d", resp.StatusCode)
 }
 
 func (s *storageClient) addHeaders(req *http.Request) {
@@ -203,5 +229,7 @@ func (s *storageClient) addHeaders(req *http.Request) {
 
 	if s.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.bearerToken)
+	} else if s.basicAuthUser != "" {
+		req.SetBasicAuth(s.basicAuthUser, s.basicAuthPass)
 	}
 }

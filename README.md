@@ -31,6 +31,8 @@ production ready) **C++** implementation.
 - Cross-platform: Linux, macOS, Windows
 - Bearer token authentication support
 - Optional debug logging
+- [netrc](https://everything.curl.dev/usingcurl/netrc.html) support
+
 
 ## Installation
 
@@ -94,6 +96,8 @@ See also the [HTTP storage wiki page] for tips on how to set up a storage server
 The helper supports the following custom attributes:
 
 - `@bearer-token`: Bearer token for `Authorization` header
+- `@use-netrc`: Enable [netrc](https://everything.curl.dev/usingcurl/netrc.html) authentication
+- `@netrc-file`: Path to custom [netrc](https://everything.curl.dev/usingcurl/netrc.html) file (implies `@use-netrc`)
 
 Example:
 

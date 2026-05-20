@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 )
+
+const ipcBufferSize = 64 << 10
 
 type ipcServer struct {
 	config    *config
@@ -81,13 +84,24 @@ func (s *ipcServer) acceptLoop() {
 func (s *ipcServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	if err := writeGreeting(conn); err != nil {
+	writer := bufio.NewWriterSize(conn, ipcBufferSize)
+
+	if err := writeGreeting(writer, s.config.FormatMax, s.config.Diagnostics); err != nil {
+		s.logger.logf("Failed to send greeting: %v", err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
 		s.logger.logf("Failed to send greeting: %v", err)
 		return
 	}
 
+	reader := bufio.NewReaderSize(conn, ipcBufferSize)
+
 	for {
-		shouldStop, err := processRequest(conn, s.storage, s.logger)
+		shouldStop, err := processRequest(reader, writer, s.storage, s.logger)
+		if err == nil {
+			err = writer.Flush()
+		}
 		if err != nil {
 			if err == io.EOF {
 				s.logger.logf("Client disconnected")
